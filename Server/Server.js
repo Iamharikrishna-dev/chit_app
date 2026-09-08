@@ -1,18 +1,15 @@
-//  * PPM Chits — Simple Secure Backend (PostgreSQL)
-//  * -----------------------------------------------
-//  * One main file. PostgreSQL via the plain `pg` driver — no ORM, so every
-//  * query is visible and easy to follow. Run `npm run init-db` once first
-//  * to create the users table.
-//  *
-//  * Security included:
-//  *   - bcrypt password hashing
-//  *   - JWT session token in an httpOnly cookie (never touchable by JS)
-//  *   - Rate limiting on login
-//  *   - Account lockout after repeated failed attempts
-//  *   - Generic error messages (no email enumeration)
-//  *   - Helmet security headers + locked-down CORS
-//  *   - Parameterized SQL everywhere (no injection risk)
-//  *
+/**
+ * PPM Chits — Simple Secure Backend (PostgreSQL)
+ * -----------------------------------------------
+ * Complete production-ready backend with:
+ * - Auth (register, login, logout, me)
+ * - Party Master (CRUD parties + members)
+ * - User Management (CRUD users, lock/unlock, roles)
+ * - Security: bcrypt, JWT, rate limiting, account lockout, parameterized SQL
+ *
+ * Run once: npm run init-db
+ * Then: npm start
+ */
 
 require("dotenv").config();
 
@@ -47,18 +44,10 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-/* ============================================================
-   DATABASE
-   Run `npm run init-db` once before starting the server.
-============================================================ */
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-/* ============================================================
-   ROLES / PERMISSIONS
-   Keep these names in sync with the frontend's ROLES array and
-   getPermissions() in UserManagement.jsx.
-============================================================ */
 const ROLES = ["super_admin", "admin", "manager", "staff", "viewer"];
+const ALL_COMPANIES = ["Company 1", "Company 2", "Company 3"];
 
 function getPermissions(role) {
   return {
@@ -73,7 +62,7 @@ function getPermissions(role) {
    APP SETUP
 ============================================================ */
 const app = express();
-app.set("trust proxy", 1); // needed behind Caddy/Nginx
+app.set("trust proxy", 1);
 
 app.use(helmet());
 
@@ -109,7 +98,17 @@ function setAuthCookie(res, token) {
     sameSite: "strict",
     domain: COOKIE_DOMAIN || undefined,
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function clearAuthCookie(res) {
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: COOKIE_SECURE === "true",
+    sameSite: "strict",
+    domain: COOKIE_DOMAIN || undefined,
+    path: "/",
   });
 }
 
@@ -134,8 +133,6 @@ function requireRole(...roles) {
   };
 }
 
-// Generic permission gate driven by getPermissions(), used for the
-// User Management routes (canAdd / canEdit / canDelete / canLock).
 function requirePermission(permissionKey) {
   return (req, res, next) => {
     const permissions = getPermissions(req.user?.role);
@@ -157,16 +154,30 @@ function isValidRole(role) {
   return ROLES.includes(role);
 }
 
-// small wrapper so route handlers can just `throw` / reject and it's caught centrally
 function asyncRoute(fn) {
   return (req, res, next) => fn(req, res, next).catch(next);
 }
 
+function safeCompaniesFor(role, requested) {
+  if (role === "super_admin") return ALL_COMPANIES;
+  return Array.isArray(requested) ? requested.filter((c) => ALL_COMPANIES.includes(c)) : [];
+}
+
+function parseJsonbField(field) {
+  if (typeof field === 'string') {
+    try {
+      return JSON.parse(field);
+    } catch {
+      return field;
+    }
+  }
+  return field || null;
+}
+
 /* ============================================================
-   ROUTES
+   AUTH ROUTES
 ============================================================ */
 
-// --- Register (lock down after creating your first admin — see README) ---
 app.post(
   "/api/auth/register",
   asyncRoute(async (req, res) => {
@@ -188,20 +199,20 @@ app.post(
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const safeRole = role === "admin" || role === "super_admin" ? role : "staff";
+    const safeRole = (role === "admin" || role === "super_admin") ? role : "staff";
+    const companiesToSave = safeRole === "super_admin" ? ALL_COMPANIES : [];
 
     const result = await pool.query(
-      `INSERT INTO users (email, password_hash, name, role)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, email, name, role`,
-      [email, passwordHash, name.trim(), safeRole]
+      `INSERT INTO users (email, password_hash, name, role, companies)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, email, name, role, companies`,
+      [email, passwordHash, name.trim(), safeRole, JSON.stringify(companiesToSave)]
     );
 
     return res.status(201).json(result.rows[0]);
   })
 );
 
-// --- Login ---
 app.post(
   "/api/auth/login",
   loginLimiter,
@@ -216,7 +227,6 @@ app.post(
 
     if (!user || !user.is_active) return genericError();
 
-    // Lockout check
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       const minutesLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
       return res.status(423).json({
@@ -244,7 +254,6 @@ app.post(
       return genericError();
     }
 
-    // Success — reset failure count
     await pool.query(
       `UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = $1`,
       [user.id]
@@ -256,21 +265,29 @@ app.post(
       { expiresIn: JWT_EXPIRES_IN }
     );
 
+    const companies = parseJsonbField(user.companies) || [];
+    const screenOverrides = parseJsonbField(user.screen_overrides) || {};
+
     setAuthCookie(res, token);
 
     return res.json({
-      user: { id: user.id, email: user.email, name: user.name, role: user.role, companies: user.companies, screen_overrides: user.screen_overrides },
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        companies,
+        screen_overrides: screenOverrides,
+      },
     });
   })
 );
 
-// --- Logout ---
 app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("token", { path: "/" });
+  clearAuthCookie(res);
   return res.json({ ok: true });
 });
 
-// --- Current user ---
 app.get(
   "/api/auth/me",
   requireAuth,
@@ -281,36 +298,32 @@ app.get(
     );
     const user = result.rows[0];
     if (!user || !user.is_active) return res.status(401).json({ error: "Not authenticated." });
-    return res.json({ id: user.id, email: user.email, name: user.name, role: user.role, companies: user.companies, screen_overrides: user.screen_overrides });
+
+    const companies = parseJsonbField(user.companies) || [];
+    const screenOverrides = parseJsonbField(user.screen_overrides) || {};
+
+    return res.json({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      companies,
+      screen_overrides: screenOverrides,
+    });
   })
 );
 
-// --- Example protected, role-restricted route ---
 app.get("/api/auth/admin-only", requireAuth, requireRole("admin", "super_admin"), (req, res) => {
   res.json({ message: "Welcome, admin." });
 });
 
-app.get("/api/health", asyncRoute(async (req, res) => {
-  await pool.query("SELECT 1");
-  res.json({ ok: true, db: "connected" });
-}));
-
 /* ============================================================
    PARTY MASTER ROUTES
-   (previously in a separate parties-routes.js — moved inline so
-   `app`, `pool`, `requireAuth`, `asyncRoute` are in scope. This
-   MUST come before the 404 catch-all below, or every /api/parties
-   request falls through to it.)
 ============================================================ */
 
-// --- Helper: fetch all parties with their members attached ---
 async function fetchAllParties() {
-  const partiesResult = await pool.query(
-    "SELECT * FROM parties ORDER BY id ASC"
-  );
-  const membersResult = await pool.query(
-    "SELECT * FROM party_members ORDER BY id ASC"
-  );
+  const partiesResult = await pool.query("SELECT * FROM parties ORDER BY id ASC");
+  const membersResult = await pool.query("SELECT * FROM party_members ORDER BY id ASC");
 
   const membersByParty = {};
   membersResult.rows.forEach((m) => {
@@ -338,7 +351,6 @@ async function fetchAllParties() {
   }));
 }
 
-// --- GET /api/parties — list all parties ---
 app.get(
   "/api/parties",
   requireAuth,
@@ -348,7 +360,6 @@ app.get(
   })
 );
 
-// --- POST /api/parties — create a new party (+ its members) ---
 app.post(
   "/api/parties",
   requireAuth,
@@ -396,7 +407,6 @@ app.post(
   })
 );
 
-// --- PUT /api/parties/:id — update a party (+ replace its members) ---
 app.put(
   "/api/parties/:id",
   requireAuth,
@@ -426,7 +436,6 @@ app.put(
         return res.status(404).json({ error: "Party not found." });
       }
 
-      // Replace members: simplest correct approach — delete old, insert new
       await client.query("DELETE FROM party_members WHERE party_id = $1", [id]);
 
       const memberList =
@@ -454,7 +463,6 @@ app.put(
   })
 );
 
-// --- DELETE /api/parties/:id ---
 app.delete(
   "/api/parties/:id",
   requireAuth,
@@ -464,36 +472,14 @@ app.delete(
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Party not found." });
     }
-    // party_members rows are removed automatically via ON DELETE CASCADE
     res.json({ ok: true });
   })
 );
 
 /* ============================================================
    USER MANAGEMENT ROUTES
-   Mirrors the frontend's UserManagement.jsx exactly:
-   ROLES = ["super_admin", "admin", "manager", "staff", "viewer"]
-     - super_admin : add, edit, delete, lock — access to all companies
-     - admin       : edit + lock only, cannot add or delete
-     - manager/staff/viewer : read-only (GET only)
-
-   Requires a `companies` column on the `users` table (jsonb or text[]),
-   e.g.:
-     ALTER TABLE users ADD COLUMN companies JSONB NOT NULL DEFAULT '[]';
-
-   This is the block that was missing — without it, /api/users returns
-   404 for every request, which is why "User Management" does nothing
-   when clicked on the frontend even though the menu item and page exist.
 ============================================================ */
 
-const ALL_COMPANIES = ["Company 1", "Company 2", "Company 3"]; // keep in sync with Sidebar.jsx
-
-function safeCompaniesFor(role, requested) {
-  if (role === "super_admin") return ALL_COMPANIES;
-  return Array.isArray(requested) ? requested.filter((c) => ALL_COMPANIES.includes(c)) : [];
-}
-
-// --- GET /api/users — any authenticated user can view (read-only for viewer/manager/staff) ---
 app.get(
   "/api/users",
   requireAuth,
@@ -508,7 +494,6 @@ app.get(
   })
 );
 
-// --- POST /api/users — create a new user. super_admin only. ---
 app.post(
   "/api/users",
   requireAuth,
@@ -537,14 +522,13 @@ app.post(
       `INSERT INTO users (email, password_hash, name, role, is_active, companies)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, email, name, role, is_active, failed_login_count, locked_until, created_at, companies`,
-      [email.trim().toLowerCase(), passwordHash, name.trim(), role, is_active !== false, companiesToSave]
+      [email.trim().toLowerCase(), passwordHash, name.trim(), role, is_active !== false, JSON.stringify(companiesToSave)]
     );
 
     res.status(201).json(result.rows[0]);
   })
 );
 
-// --- PUT /api/users/:id — edit an existing user. super_admin or admin. ---
 app.put(
   "/api/users/:id",
   requireAuth,
@@ -564,7 +548,8 @@ app.put(
     }
 
     const finalRole = role || existing.rows[0].role;
-    const companiesToSave = safeCompaniesFor(finalRole, companies ?? existing.rows[0].companies);
+    const existingCompanies = parseJsonbField(existing.rows[0].companies) || [];
+    const companiesToSave = safeCompaniesFor(finalRole, companies ?? existingCompanies);
 
     let passwordHash = existing.rows[0].password_hash;
     if (password) {
@@ -579,14 +564,13 @@ app.put(
        SET name = $1, role = $2, is_active = $3, password_hash = $4, companies = $5
        WHERE id = $6
        RETURNING id, email, name, role, is_active, failed_login_count, locked_until, created_at, companies`,
-      [name.trim(), finalRole, is_active !== false, passwordHash, companiesToSave, id]
+      [name.trim(), finalRole, is_active !== false, passwordHash, JSON.stringify(companiesToSave), id]
     );
 
     res.json(result.rows[0]);
   })
 );
 
-// --- PATCH /api/users/:id/lock — lock/unlock an account. super_admin or admin. ---
 app.patch(
   "/api/users/:id/lock",
   requireAuth,
@@ -596,7 +580,7 @@ app.patch(
     const { locked } = req.body || {};
 
     const lockedUntil = locked
-      ? new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString() // ~1 year, i.e. "until manually unlocked"
+      ? new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString()
       : null;
 
     const result = await pool.query(
@@ -612,7 +596,6 @@ app.patch(
   })
 );
 
-// --- DELETE /api/users/:id — super_admin only. ---
 app.delete(
   "/api/users/:id",
   requireAuth,
@@ -629,6 +612,19 @@ app.delete(
     res.json({ ok: true });
   })
 );
+
+/* ============================================================
+   HEALTH CHECK
+============================================================ */
+
+app.get("/api/health", asyncRoute(async (req, res) => {
+  await pool.query("SELECT 1");
+  res.json({ ok: true, db: "connected" });
+}));
+
+/* ============================================================
+   ERROR HANDLING
+============================================================ */
 
 app.use((req, res) => res.status(404).json({ error: "Not found." }));
 
