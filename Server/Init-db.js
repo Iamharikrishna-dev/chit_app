@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * PPM Chits — Complete Database Initialization
- * Creates all tables: users, parties, party_members
- * Seeds super_admin account
+ * Creates database, user, and all tables
+ * Handles existing database/user gracefully
  * 
- * Run: node init-db.js
+ * Run: node Init-db.js
  */
 
 require("dotenv").config();
@@ -19,11 +19,69 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-const pool = new Pool({ connectionString: DATABASE_URL });
-
 async function initDb() {
   try {
-    console.log("🔧 Creating database tables...\n");
+    console.log("🔧 PPM Chits Database Initialization\n");
+
+    // Parse DATABASE_URL
+    const url = new URL(DATABASE_URL);
+    const dbUser = url.username;
+    const dbPassword = url.password;
+    const dbHost = url.hostname;
+    const dbPort = url.port || 5432;
+    const dbName = url.pathname.slice(1);
+
+    console.log("📊 Database Configuration:");
+    console.log(`   Host: ${dbHost}:${dbPort}`);
+    console.log(`   Database: ${dbName}`);
+    console.log(`   User: ${dbUser}\n`);
+
+    // Connect to default 'postgres' database to create ppm_chits database
+    const adminPool = new Pool({
+      user: dbUser,
+      password: dbPassword,
+      host: dbHost,
+      port: dbPort,
+      database: 'postgres',
+    });
+
+    try {
+      // Create database if not exists
+      console.log("🗄️  Creating database...");
+      await adminPool.query(`CREATE DATABASE ${dbName}`);
+      console.log(`   ✓ Database '${dbName}' created\n`);
+    } catch (err) {
+      if (err.code === '42P04') {
+        console.log(`   ✓ Database '${dbName}' already exists\n`);
+      } else {
+        throw err;
+      }
+    }
+
+    try {
+      // Create user if not exists
+      console.log("👤 Creating database user...");
+      await adminPool.query(`CREATE USER ${dbUser} WITH PASSWORD '${dbPassword}'`);
+      console.log(`   ✓ User '${dbUser}' created\n`);
+    } catch (err) {
+      if (err.code === '42710') {
+        console.log(`   ✓ User '${dbUser}' already exists\n`);
+      } else {
+        throw err;
+      }
+    }
+
+    // Grant privileges
+    console.log("🔐 Granting privileges...");
+    await adminPool.query(`GRANT ALL PRIVILEGES ON DATABASE ${dbName} TO ${dbUser}`);
+    console.log(`   ✓ All privileges granted\n`);
+
+    await adminPool.end();
+
+    // Now connect to the app database
+    const pool = new Pool({ connectionString: DATABASE_URL });
+
+    console.log("🔧 Creating tables...\n");
 
     // Users table
     await pool.query(`
@@ -42,7 +100,7 @@ async function initDb() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log("✓ Users table created");
+    console.log("   ✓ Users table created");
 
     // Parties table
     await pool.query(`
@@ -59,7 +117,7 @@ async function initDb() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log("✓ Parties table created");
+    console.log("   ✓ Parties table created");
 
     // Party members table
     await pool.query(`
@@ -73,16 +131,16 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log("✓ Party Members table created\n");
+    console.log("   ✓ Party Members table created\n");
 
-    // Check if super_admin exists
+    // Seed admin user
     const adminCheck = await pool.query(
       "SELECT id FROM users WHERE role = $1 LIMIT 1",
       ["super_admin"]
     );
 
     if (adminCheck.rows.length === 0) {
-      console.log("🔐 No super_admin found. Creating initial admin...\n");
+      console.log("🔐 Seeding admin account...\n");
 
       const adminEmail = process.env.ADMIN_EMAIL || "admin@ppmchits.local";
       const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe@12345";
@@ -102,27 +160,34 @@ async function initDb() {
         ]
       );
 
-      console.log("✓ Super admin account created:");
-      console.log(`  📧 Email: ${adminEmail}`);
-      console.log(`  🔑 Password: ${adminPassword}`);
-      console.log(`  🏢 Companies: Company 1, Company 2, Company 3`);
-      console.log(`  ⚠️  IMPORTANT: Change password immediately after first login!\n`);
+      console.log("   ✓ Super admin account created:");
+      console.log(`     📧 Email: ${adminEmail}`);
+      console.log(`     🔑 Password: ${adminPassword}`);
+      console.log(`     🏢 Companies: Company 1, Company 2, Company 3`);
+      console.log(`     ⚠️  CHANGE PASSWORD after first login!\n`);
     } else {
-      console.log("✓ Super admin already exists. Skipping seed.\n");
+      console.log("   ✓ Super admin already exists. Skipping seed.\n");
     }
 
-    console.log("✅ Database initialization completed successfully!");
-    console.log("\n📋 Next steps:");
+    await pool.end();
+
+    console.log("✅ Database initialization completed successfully!\n");
+    console.log("📋 Next steps:");
     console.log("   1. npm start              → Start backend (port 4000)");
     console.log("   2. cd ../Client           → Navigate to frontend");
-    console.log("   3. npm run dev            → Start frontend (port 5173)");
-    console.log("\n🔗 Access the app at http://localhost:5173");
+    console.log("   3. npm run dev            → Start frontend (port 5173)\n");
+    console.log("🔗 Access: http://localhost:5173\n");
+
   } catch (err) {
-    console.error("❌ Database initialization failed:", err.message);
-    if (err.detail) console.error("   Detail:", err.detail);
+    console.error("❌ Database initialization failed:\n");
+    console.error(`   Error: ${err.message}`);
+    if (err.detail) console.error(`   Detail: ${err.detail}`);
+    if (err.code) console.error(`   Code: ${err.code}`);
+    console.error("\n💡 Troubleshooting:");
+    console.error("   • Verify PostgreSQL is running");
+    console.error("   • Check DATABASE_URL in .env");
+    console.error("   • Ensure initial admin user has superuser privileges\n");
     process.exit(1);
-  } finally {
-    await pool.end();
   }
 }
 
